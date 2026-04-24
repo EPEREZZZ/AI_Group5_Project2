@@ -1,0 +1,14 @@
+# Ignore Log Files
+*.log
+
+# Ignore Virtual Environment
+.venv
+
+# Ignore .mov
+*.mov
+
+# Ignore pycache
+__pycache__
+
+# Ignore "Project 2 - Group 5" zip file
+Project 2 - Group 5
