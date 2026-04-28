@@ -15,3 +15,6 @@ Project 2 - Group 5
 
 # Ignore vscode workspace settings
 .vscode
+
+# Ignore actor critic template
+actor_crtic.py
