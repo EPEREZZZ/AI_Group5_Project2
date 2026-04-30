@@ -10,7 +10,7 @@ import os
 
 
 # Trains once, save weights, then load in the future if they exist
-TRAINING_EPISODES = 5000
+TRAINING_EPISODES = 10000
 LEARNING_RATE = 0.001
 INSPECT_TRAINING = 20
 FINAL_REWARD_MULTIPLIER = 100
