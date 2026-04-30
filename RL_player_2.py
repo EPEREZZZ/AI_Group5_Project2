@@ -1,65 +1,77 @@
-#Zijie Zhang, Sep.24/2023
+# Zijie Zhang, Sep.24/2023
 
 import numpy as np
 import socket, pickle
 from reversi import reversi
-import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 import os
+
+
+# This player trains once, saves weights, then loads them in the future if they exist
+TRAINING_EPISODES = 5000
+LEARNING_RATE = 0.001
+INSPECT_TRAINING = 20
+FINAL_REWARD_MULTIPLIER = 100
+POLICY_BONUS_MULTIPLIER = 1
+HIDDEN_NEURONS = 128
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reversi_policy.pt")
 
 # Constants
 CORNERS = [(0,0), (0, 7), (7, 0), (7, 7)]
 
-MAX,MIN = float('inf'),float('-inf')
-
-HIDDEN_NEURONS = 256
-TRAINING_EPISODES = 100000
-EVAL_EVERY = 1000
-EVAL_GAMES = 30
-CONTINUE_TRAINING = True
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reversi_policy.pt")
-
-class TimeoutException(Exception):
-    pass
-
 class PolicyNetwork(nn.Module):
+    """Small multilayer policy network."""
+
     def __init__(self):
         super(PolicyNetwork, self).__init__()
         self.layer1 = nn.Linear(64, HIDDEN_NEURONS)
-        self.layer2 = nn.Linear(HIDDEN_NEURONS, 64)
+        self.layer2 = nn.Linear(HIDDEN_NEURONS, HIDDEN_NEURONS)
+        self.layer3 = nn.Linear(HIDDEN_NEURONS, 64)
 
     def forward(self, x):
-        x = torch.tanh(self.layer1(x))
-        return F.softmax(self.layer2(x), dim=1)
+        x = torch.relu(self.layer1(x))
+        x = torch.relu(self.layer2(x))
+        return self.layer3(x)
 
 class ReversiHelper:
     def find_available_moves(self, current_board: np.ndarray, turn: int) -> list:
         """Return a list of legal moves"""
-        temp_board = reversi()
-        temp_board.board = current_board
+        temp_game = reversi()
+        temp_game.board = current_board
 
         # Find possible legal moves
         moves = []
-        for a in range(8):
-            for b in range(8):
-                if temp_board.step(a, b, turn, False) > 0:
-                    moves.append((a, b)) # Append each possible move as tuple
+        for i in range(8):
+            for j in range(8):
+                if temp_game.step(i, j, turn, False) > 0:
+                    moves.append((i, j)) # Append each possible move as tuple
         return moves
 
     def use_turn(self, current_board: np.ndarray, move: tuple, turn: int) -> np.ndarray:
         """Return new board copy after making a move"""
-        game = reversi() # temp game instance
-
-        game.board = np.copy(current_board) # Copy board
-
+        temp_game = reversi() # temp game instance
+        temp_game.board = np.copy(current_board) # Copy board
+        
         # Make Move
         x, y = move
-        game.step(x, y, turn, True)
+        temp_game.step(x, y, turn, True)
+        return temp_game.board
 
-        return game.board
+    def greedy_move(self, current_board: np.ndarray, turn: int, moves: list):
+        """Greedy algorithm for training"""
+        temp_game = reversi()
+        temp_game.board = current_board
+
+        best_move = moves[0]
+        best_flips = 0
+        for move in moves:
+            flips = temp_game.step(move[0], move[1], turn, False)
+            if flips > best_flips:
+                best_flips = flips
+                best_move = move
+        return best_move
 
     def board_score(self, current_board: np.ndarray, player: int) -> int:
         """Give a score to a board after a move is done"""
@@ -90,177 +102,110 @@ class ReversiHelper:
         total_player_score = (corner_score * cs_mult) + (pieces_score * ps_mult) + (mobility_score * ms_mult)
         return int(total_player_score)
 
-    def greedy_train(self, current_board: np.ndarray, player: int, moves: list):
-        """Use greedy algorithm as initial trainer"""
-        best_move = moves[0]
-        best_score = float('-inf')
-        for move in moves:
-            new_board = self.use_turn(current_board, move, player)
-            score = self.board_score(new_board, player)
-            if score > best_score:
-                best_score = score
-                best_move = move
-        return best_move
-
-    def game_reward(self, current_board: np.ndarray, player: int):
-        """Determine final game reward"""
+    def game_reward(self, current_board: np.ndarray, player: int) -> float:
+        """Final win/loss reward to influence the learner"""
         player_pieces = np.sum(current_board == player)
         opponent_pieces = np.sum(current_board == -player)
+
         if player_pieces > opponent_pieces:
             return 1.0
         if player_pieces < opponent_pieces:
             return -1.0
         return 0.0
 
+
 class PolicyAgent:
     def __init__(self):
-        self.device = torch.device(
-            "mps" if torch.backends.mps.is_available()
-            else "cuda" if torch.cuda.is_available()
-            else "cpu"
-        )
+        self.device = self.choose_device()
         self.helper = ReversiHelper()
-        self.policy = self.load_or_train_policy()
+        self.policy = PolicyNetwork().to(self.device)
+        self.load_or_train_policy()
+
+    def choose_device(self):
+        """Use Apple Silicon GPU, then CUDA, then CPU. Works on Mac and Windows."""
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            print("Training using mpc (Apple Silicon)")
+            return torch.device("mps")
+        if torch.cuda.is_available():
+            print("Training using cuda")
+            return torch.device("cuda")
+        else:
+            print("Training using CPU")
+            return torch.device("cpu")
+
+    def load_or_train_policy(self):
+        """Load saved weights if they exist; otherwise train and save them."""
+        if os.path.exists(MODEL_PATH):
+            try:
+                self.policy.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
+                self.policy.eval()
+                print(f"Loaded policy weights from {MODEL_PATH}")
+                return
+            except RuntimeError:
+                print("Failed to load policy weights. Training new weights...")
+
+        self.train_policy()
+        torch.save(self.policy.state_dict(), MODEL_PATH)
+        print(f"Saved policy weights to {MODEL_PATH}")
 
     def board_tensor(self, current_board: np.ndarray, player: int):
-        """Return board state as a tensor"""
+        """Convert the board to a 1x64 tensor where this player's pieces are 1 and the opponent's are -1"""
         state = (current_board * player).astype(np.float32).reshape(1, 64)
         return torch.tensor(state, dtype=torch.float32, device=self.device)
 
-    def legal_action_probs(self, policy, current_board: np.ndarray, player: int, moves: list):
-        """Return probabilities for legal moves"""
-        probs = policy(self.board_tensor(current_board, player)).squeeze(0)
-        mask = torch.zeros(64, device=self.device)
+    def legal_move_scores(self, current_board: np.ndarray, player: int, moves: list):
+        """Return move scores where illegal moves are blocked"""
+        move_scores = self.policy(self.board_tensor(current_board, player)).squeeze(0)
+        blocked_moves = torch.full((64,), -1.0e9, dtype=torch.float32, device=self.device)
+
         for move_x, move_y in moves:
-            mask[move_x * 8 + move_y] = 1.0
+            blocked_moves[move_x * 8 + move_y] = 0.0
 
-        probs = probs * mask
-        if torch.sum(probs).item() == 0:
-            probs = mask / torch.sum(mask)
-        else:
-            probs = probs / torch.sum(probs)
-        return probs
+        return move_scores + blocked_moves
 
-    def choose_policy_move(self, policy, current_board: np.ndarray, player: int, moves: list):
-        """Choose best legal policy move"""
+    def sample_policy_move(self, current_board: np.ndarray, player: int, moves: list):
+        """Sample legal move for training and return log prob"""
+        move_scores = self.legal_move_scores(current_board, player, moves)
+        distribution = torch.distributions.Categorical(logits=move_scores)
+        action = distribution.sample()
+        move = (int(action.item()) // 8, int(action.item()) % 8)
+        return move, distribution.log_prob(action)
+
+    def choose_policy_move(self, current_board: np.ndarray, player: int, moves: list):
+        """Choose the best move, with small policy bonus"""
         with torch.no_grad():
-            probs = self.legal_action_probs(policy, current_board, player, moves)
+            move_scores = self.legal_move_scores(current_board, player, moves)
 
         best_move = moves[0]
-        best_score = float('-inf')
+        best_score = float("-inf")
         for move in moves:
             action_index = move[0] * 8 + move[1]
             new_board = self.helper.use_turn(current_board, move, player)
-            score = self.helper.board_score(new_board, player) + (float(probs[action_index].detach().cpu()) * 25)
+            board_score = self.helper.board_score(new_board, player)
+            policy_bonus = float(move_scores[action_index].detach().cpu()) * POLICY_BONUS_MULTIPLIER
+            score = board_score + policy_bonus
+
             if score > best_score:
                 best_score = score
                 best_move = move
+
         return best_move
 
-    def save_policy(self, policy, episode: int, best_score: float):
-        """Save policy that was trained"""
-        checkpoint = {
-            "policy_state_dict": {key: value.detach().cpu() for key, value in policy.state_dict().items()},
-            "hidden_neurons": int(HIDDEN_NEURONS),
-            "episodes": int(episode),
-            "best_score": float(best_score),
-            "device_used": str(self.device),
-        }
-        torch.save(checkpoint, MODEL_PATH)
-
-    def load_checkpoint(self):
-        """Load saved checkpoint data"""
-        try:
-            checkpoint = torch.load(MODEL_PATH, map_location=self.device)
-        except pickle.UnpicklingError:
-            checkpoint = torch.load(MODEL_PATH, map_location=self.device, weights_only=False)
-        if checkpoint.get("hidden_neurons") != HIDDEN_NEURONS:
-            raise ValueError("Checkpoint was trained with a different hidden layer size.")
-        return checkpoint
-
-    def load_policy_from_checkpoint(self, training: bool = False):
-        """Load policy from checkpoint"""
-        policy = PolicyNetwork().to(self.device)
-        checkpoint = self.load_checkpoint()
-        policy.load_state_dict(checkpoint["policy_state_dict"])
-        if training:
-            policy.train()
-        else:
-            policy.eval()
-        return policy, checkpoint
-
-    def load_policy(self):
-        """Load policy (if exists)"""
-        policy, checkpoint = self.load_policy_from_checkpoint(False)
-        self.save_policy(policy, int(checkpoint.get("episodes", 0)), float(checkpoint.get("best_score", 0.0)))
-        print(f"Loaded policy checkpoint from {MODEL_PATH}")
-        return policy
-
-    def evaluate_policy(self, policy, games: int):
-        """Return policy evaluation score"""
-        policy.eval()
-        total_score = 0.0
-        for game_number in range(games):
-            temp_game = reversi()
-            learner = 1 if game_number % 2 == 0 else -1
-            current_turn = 1
-            passes = 0
-
-            while passes < 2:
-                legal_moves = self.helper.find_available_moves(temp_game.board, current_turn)
-                if len(legal_moves) == 0:
-                    passes += 1
-                    current_turn = -current_turn
-                    continue
-
-                passes = 0
-                if current_turn == learner:
-                    move = self.choose_policy_move(policy, temp_game.board, current_turn, legal_moves)
-                else:
-                    move = self.helper.greedy_train(temp_game.board, current_turn, legal_moves)
-
-                temp_game.board = self.helper.use_turn(temp_game.board, move, current_turn)
-                current_turn = -current_turn
-
-            total_score += self.helper.game_reward(temp_game.board, learner) * 100
-            total_score += np.sum(temp_game.board == learner) - np.sum(temp_game.board == -learner)
-
-        policy.train()
-        return float(total_score / games)
-
     def train_policy(self):
-        """Train the policy network"""
+        """Train 🏋️‍♀️"""
+        # Random seed
         torch.manual_seed(1)
         np.random.seed(1)
-        opponent_policy = None
-        best_state = None
-        if os.path.exists(MODEL_PATH):
-            try:
-                policy, checkpoint = self.load_policy_from_checkpoint(True)
-                opponent_policy, _ = self.load_policy_from_checkpoint(False)
-                best_score = float(checkpoint.get("best_score", float('-inf')))
-                best_state = {key: value.detach().cpu().clone() for key, value in policy.state_dict().items()}
-                print(f"Training from checkpoint against previous policy: {MODEL_PATH}")
-            except (RuntimeError, ValueError, KeyError, pickle.UnpicklingError) as error:
-                print(f"Could not use checkpoint for self-play: {error}")
-                print("Training from a new policy against greedy.")
-                policy = PolicyNetwork().to(self.device)
-                best_score = float('-inf')
-        else:
-            policy = PolicyNetwork().to(self.device)
-            best_score = float('-inf')
-        optimizer = optim.Adam(policy.parameters(), lr=0.001)
 
-        print(f"Training policy on {self.device} for {TRAINING_EPISODES} episodes...")
+        optimizer = optim.Adam(self.policy.parameters(), lr=LEARNING_RATE)
+        print(f"Training policy network on {self.device} for {TRAINING_EPISODES} episodes against greedy")
+
         for episode in range(1, TRAINING_EPISODES + 1):
-            policy.train()
-            if episode % 1000 == 0:
-                print(f"trained episodes: {episode}/{TRAINING_EPISODES}")
             temp_game = reversi()
-            current_turn = 1
             learner = 1 if episode % 2 == 0 else -1
+            current_turn = 1
             passes = 0
-            log_probs = []
+            move_feedback = []
 
             while passes < 2:
                 legal_moves = self.helper.find_available_moves(temp_game.board, current_turn)
@@ -271,68 +216,55 @@ class PolicyAgent:
 
                 passes = 0
                 if current_turn == learner:
-                    probs = self.legal_action_probs(policy, temp_game.board, current_turn, legal_moves)
-                    action = torch.distributions.Categorical(probs).sample()
-                    log_probs.append(torch.log(probs[action] + 1e-8))
-                    move = (int(action.item()) // 8, int(action.item()) % 8)
+                    before_score = self.helper.board_score(temp_game.board, learner)
+                    move, log_prob = self.sample_policy_move(temp_game.board, current_turn, legal_moves)
+                    new_board = self.helper.use_turn(temp_game.board, move, current_turn)
+                    after_score = self.helper.board_score(new_board, learner)
+                    score_change = after_score - before_score
+                    move_feedback.append((log_prob, float(score_change)))
                 else:
-                    if opponent_policy is not None:
-                        move = self.choose_policy_move(opponent_policy, temp_game.board, current_turn, legal_moves)
-                    else:
-                        move = self.helper.greedy_train(temp_game.board, current_turn, legal_moves)
+                    move = self.helper.greedy_move(temp_game.board, current_turn, legal_moves)
+                    new_board = self.helper.use_turn(temp_game.board, move, current_turn)
 
-                temp_game.board = self.helper.use_turn(temp_game.board, move, current_turn)
+                temp_game.board = new_board
                 current_turn = -current_turn
 
-            reward = self.helper.game_reward(temp_game.board, learner)
-            if len(log_probs) > 0:
-                loss = -torch.stack(log_probs).sum() * reward
+            final_reward = self.helper.game_reward(temp_game.board, learner) * FINAL_REWARD_MULTIPLIER
+            if len(move_feedback) > 0:
+                losses = []
+                for log_prob, score_change in move_feedback:
+                    reward = score_change + final_reward
+                    if reward != 0.0:
+                        losses.append(-log_prob * reward)
+
+                if len(losses) == 0:
+                    continue
+
+                loss = torch.stack(losses).sum()
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-            if episode % EVAL_EVERY == 0:
-                score = self.evaluate_policy(policy, EVAL_GAMES)
-                print(f"episode={episode} eval_score={score:.2f} best_score={best_score:.2f}")
-                if score > best_score:
-                    best_score = score
-                    best_state = {key: value.detach().cpu().clone() for key, value in policy.state_dict().items()}
-                    self.save_policy(policy, episode, best_score)
+            if episode % INSPECT_TRAINING == 0:
+                print(f"trained episodes: {episode}/{TRAINING_EPISODES}")
 
-        if best_state is not None:
-            policy.load_state_dict(best_state)
-        elif not os.path.exists(MODEL_PATH):
-            best_score = self.evaluate_policy(policy, EVAL_GAMES)
-            self.save_policy(policy, TRAINING_EPISODES, best_score)
-
-        policy.eval()
-        return policy
-
-    def load_or_train_policy(self):
-        """Return loaded or trained policy"""
-        if CONTINUE_TRAINING or not os.path.exists(MODEL_PATH):
-            return self.train_policy()
-        try: # Attempt to use saved policy if exists
-            return self.load_policy()
-        except (RuntimeError, ValueError, KeyError) as error:
-            print(f"Could not load checkpoint: {error}")
-            print("Training a new policy checkpoint.")
-            return self.train_policy()
+        self.policy.eval()
 
     def choose_move(self, current_board: np.ndarray, turn: int):
-        """Choose move for the current board"""
+        """Choose a legal move from a given board"""
         moves = self.helper.find_available_moves(current_board, turn)
         if len(moves) == 0:
             return -1, -1
-        return self.choose_policy_move(self.policy, current_board, turn, moves)
+        return self.choose_policy_move(current_board, turn, moves)
+
 
 def main():
-    game_socket = socket.socket()
-    game_socket.connect(('127.0.0.1', 33333))
     agent = PolicyAgent()
 
-    while True:
+    game_socket = socket.socket()
+    game_socket.connect(("127.0.0.1", 33333))
 
+    while True:
         #Receive play request from the server
         #turn : 1 --> you are playing as white | -1 --> you are playing as black
         #board : 8*8 numpy array
@@ -348,18 +280,10 @@ def main():
         print(turn)
         print(board)
 
-
-
-        # Minimax - Replace with your algorithm
-        """NOTES:
-            * 1 = white
-            * -1 = black
-        """
+        #Local RL_Player
         x, y = agent.choose_move(board, turn)
+        game_socket.send(pickle.dumps([x, y]))
 
 
-        game_socket.send(pickle.dumps([x,y]))
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
